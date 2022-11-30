@@ -8,12 +8,15 @@ import os
 import sys
 import copy
 
-from typing import Dict, List, Optional
+from gzip import GzipFile
+from gzip import open as gzip_open
+
+from typing import Dict, List, Optional, IO, Any
 from joblib import Parallel, delayed, parallel_backend
 from jsonschema import Draft7Validator, FormatChecker
 from singer import get_logger
 from datetime import datetime, timedelta
-
+from urllib.parse import urlparse
 from target_snowflake.file_formats import csv
 from target_snowflake.file_formats import parquet
 from target_snowflake import stream_utils
@@ -34,6 +37,122 @@ logging.getLogger('snowflake.connector').setLevel(logging.WARNING)
 DEFAULT_BATCH_SIZE_ROWS = 100000
 DEFAULT_PARALLELISM = 0  # 0 The number of threads used to flush tables
 DEFAULT_MAX_PARALLELISM = 16  # Don't use more than this number of threads by default when flushing streams in parallel
+
+import platform
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from typing import IO, TYPE_CHECKING, Any, ClassVar, Generator
+from urllib.parse import ParseResult, urlencode, urlparse
+
+import fs
+from fs.base import FS
+
+@dataclass
+class StorageTarget:
+    """Storage target."""
+
+    root: str
+    """"The root directory of the storage target."""
+
+    prefix: str | None = None
+    """"The file prefix."""
+
+    params: dict = field(default_factory=dict)
+    """"The storage parameters."""
+
+    def asdict(self):
+        """Return a dictionary representation of the message.
+
+        Returns:
+            A dictionary with the defined message fields.
+        """
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) :
+        """Create an encoding from a dictionary.
+
+        Args:
+            data: The dictionary to create the message from.
+
+        Returns:
+            The created message.
+        """
+        return cls(**data)
+
+    @staticmethod
+    def split_url(url: str) -> tuple[str, str]:
+        """Split a URL into a head and tail pair.
+
+        Args:
+            url: The URL to split.
+
+        Returns:
+            A tuple of the head and tail parts of the URL.
+        """
+        if platform.system() == "Windows" and "\\" in url:
+            # Original code from pyFileSystem split
+            # Augemnted slitly to properly Windows paths
+            split = url.rsplit("\\", 1)
+            return (split[0] or "\\", split[1])
+        else:
+            return fs.path.split(url)
+
+    @classmethod
+    def from_url(cls, url: str):
+        """Create a storage target from a file URL.
+
+        Args:
+            url: The URL to create the storage target from.
+
+        Returns:
+            The created storage target.
+        """
+        parsed_url = urlparse(url)
+        new_url = parsed_url._replace(query="")
+        return cls(root=new_url.geturl())
+
+    @property
+    def fs_url(self) -> ParseResult:
+        """Get the storage target URL.
+
+        Returns:
+            The storage target URL.
+        """
+        return urlparse(self.root)._replace(query=urlencode(self.params))
+
+    @contextmanager
+    def fs(self, **kwargs: Any) -> Generator[FS, None, None]:
+        """Get a filesystem object for the storage target.
+
+        Args:
+            kwargs: Additional arguments to pass ``f`.open_fs``.
+
+        Returns:
+            The filesystem object.
+        """
+        filesystem = fs.open_fs(self.fs_url.geturl(), **kwargs)
+        yield filesystem
+        filesystem.close()
+
+    @contextmanager
+    def open(self, filename: str, mode: str = "rb") -> Generator[IO, None, None]:
+        """Open a file in the storage target.
+
+        Args:
+            filename: The filename to open.
+            mode: The mode to open the file in.
+
+        Returns:
+            The opened file.
+        """
+        filesystem = fs.open_fs(self.root, writeable=True, create=True)
+        fo = filesystem.open(filename, mode=mode)
+        try:
+            yield fo
+        finally:
+            fo.close()
+            filesystem.close()
 
 
 def add_metadata_columns_to_schema(schema_message):
@@ -222,6 +341,38 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                 # emit last encountered state
                 emit_state(copy.deepcopy(flushed_state))
 
+        elif t == 'BATCH':
+            if 'stream' not in o:
+                raise Exception(f"Line is missing required key 'stream': {line}")
+            if o['stream'] not in schemas:
+                raise Exception(f"A record for stream {o['stream']} was encountered before a corresponding schema")
+
+            stream = o['stream']
+            records_to_load[stream] = {}
+            LOGGER.info('Start batch processing')
+            for file in o['manifest']:
+                batch_records = unpack_batch_file(file, stream_to_sync[stream], config)
+                records_to_load[stream].update(batch_records)
+                LOGGER.info(f"Unpacked {len(batch_records)} records from file {file}")
+            
+            row_count[stream] = len(records_to_load[stream])
+
+            # Flush and return a new state dict with new positions only for the flushed streams
+            flushed_state = flush_streams(
+                records_to_load,
+                row_count,
+                stream_to_sync,
+                config,
+                state,
+                flushed_state,
+                archive_load_files_data,
+                filter_streams=None)
+
+            flush_timestamp = datetime.utcnow()
+
+            # emit last encountered state
+            emit_state(copy.deepcopy(flushed_state))
+
         elif t == 'SCHEMA':
             if 'stream' not in o:
                 raise Exception(f"Line is missing required key 'stream': {line}")
@@ -334,7 +485,32 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     # emit latest state
     emit_state(copy.deepcopy(flushed_state))
 
+def unpack_batch_file(
+        batch_file,
+        db_sync, 
+        config
+    ):
 
+    head, tail = StorageTarget.split_url(batch_file)
+
+    storage = StorageTarget.from_url(head)
+    result = {}
+    with storage.fs(create=False) as batch_fs:
+        with batch_fs.open(tail, mode="rb") as file:
+            file = gzip_open(file)
+            for line in file:
+                record = json.loads(line)
+                primary_key_string = db_sync.record_primary_key_string(record)
+                # append record
+                if config.get('add_metadata_columns') or config.get('hard_delete'):
+                    result[primary_key_string] = stream_utils.add_metadata_values_to_record(o)
+                else:
+                    result[primary_key_string] = record
+
+    url_path = urlparse(batch_file)
+    os.remove(batch_file[7:])
+    return result
+   
 # pylint: disable=too-many-arguments
 def flush_streams(
         streams,
@@ -523,6 +699,31 @@ def main():
 
     # Consume singer messages
     singer_messages = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
+    #schema_message = {
+    #    "type": "SCHEMA",
+    #    "stream": "users",
+    #    "key_properties": ["id"],
+    #    "schema": {
+    #        "required": ["id"],
+    #        "type": "object",
+    #        "properties": {
+    #            "id": {"type": "integer"},
+    #            "name": {"type": ["null", "string"]},
+    #            "dt": {"type": ["null", "datetime"]},
+    #        },
+    #    },
+    #}
+##
+    #batch_message = {
+    #    "type": "BATCH",
+    #    "stream": "users",
+    #    "encoding": {"format": "jsonl", "compression": "gzip"},
+    #    "manifest": [
+    #        "file:///work/project_batch/batchfiles/tap-sqlserverlog--dbo-RobotLicenseLogs-89c460ae-6bef-48c9-8ec4-34c45cef6515-91.json.gz",
+    #    ],
+    #}
+#
+    #singer_messages = [json.dumps(schema_message), json.dumps(batch_message)]        
     persist_lines(config, singer_messages, table_cache, file_format_type)
 
     LOGGER.debug("Exiting normally")
